@@ -62,12 +62,56 @@ struct dvbridge_fel {
     unsigned preroll_packets;
 };
 
-static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
+/* DRM PRIME decoders: the DRM device or a V4L2 stateless (v4l2request) one.
+ * Compared by name so builds against FFmpeg without v4l2request still work. */
+static bool drm_prime_device(const AVBufferRef *device)
+{
+    if (!device)
+        return false;
+    enum AVHWDeviceType type = ((const AVHWDeviceContext *)device->data)->type;
+    const char *name = av_hwdevice_get_type_name(type);
+    return type == AV_HWDEVICE_TYPE_DRM || (name && !strcmp(name, "v4l2request"));
+}
+
+static bool supported_device(const AVBufferRef *device)
+{
+    return device && (((const AVHWDeviceContext *)device->data)->type == AV_HWDEVICE_TYPE_VAAPI ||
+                      drm_prime_device(device));
+}
+
+static enum AVPixelFormat drm_prime_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
 {
     bool found = false;
     for (; *formats != AV_PIX_FMT_NONE; ++formats)
+        found |= *formats == AV_PIX_FMT_DRM_PRIME;
+    if (!found)
+        return AV_PIX_FMT_NONE;
+    /* Size the pool for the pairing queue where the hwaccel lets us; others
+     * allocate their own DRM PRIME pool. */
+    AVBufferRef *frames = NULL;
+    if (avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx, AV_PIX_FMT_DRM_PRIME, &frames) >= 0) {
+        AVHWFramesContext *hw = (void *)frames->data;
+        hw->initial_pool_size += QUEUE_MAX + 4;
+        if (av_hwframe_ctx_init(frames) < 0) {
+            av_buffer_unref(&frames);
+            return AV_PIX_FMT_NONE;
+        }
+        av_buffer_unref(&ctx->hw_frames_ctx);
+        ctx->hw_frames_ctx = frames;
+    }
+    return AV_PIX_FMT_DRM_PRIME;
+}
+
+static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
+{
+    bool found = false;
+    if (!ctx->hw_device_ctx)
+        return AV_PIX_FMT_NONE;
+    if (drm_prime_device(ctx->hw_device_ctx))
+        return drm_prime_format(ctx, formats);
+    for (; *formats != AV_PIX_FMT_NONE; ++formats)
         found |= *formats == AV_PIX_FMT_VAAPI;
-    if (!found || !ctx->hw_device_ctx)
+    if (!found)
         return AV_PIX_FMT_NONE;
     AVBufferRef *frames = NULL;
     if (avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx, AV_PIX_FMT_VAAPI, &frames) < 0)
@@ -192,7 +236,8 @@ static bool receive_frames(struct dvbridge_fel *f)
          * not borrowed from the BL packet carrying this EL access unit. */
         if (frame->pts == AV_NOPTS_VALUE)
             frame->pts = frame->best_effort_timestamp;
-        if (frame->format != AV_PIX_FMT_VAAPI || frame->pts == AV_NOPTS_VALUE) {
+        if ((frame->format != AV_PIX_FMT_VAAPI && frame->format != AV_PIX_FMT_DRM_PRIME) ||
+            frame->pts == AV_NOPTS_VALUE) {
             av_frame_free(&frame);
             return false;
         }
@@ -261,7 +306,7 @@ fail:
 
 bool dvbridge_fel_device(struct dvbridge_fel *f, AVBufferRef *device)
 {
-    if (!f || !device || ((AVHWDeviceContext *)device->data)->type != AV_HWDEVICE_TYPE_VAAPI)
+    if (!f || !supported_device(device))
         return false;
     if (f->opened)
         return f->decoder->hw_device_ctx->data == device->data && pump(f);
