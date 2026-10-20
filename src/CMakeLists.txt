@@ -41,9 +41,19 @@ pkg_check_modules(DVAvcodec REQUIRED IMPORTED_TARGET libavcodec>=62)
 pkg_check_modules(DVGles REQUIRED IMPORTED_TARGET glesv2)
 pkg_check_modules(DVEgl REQUIRED IMPORTED_TARGET egl)
 pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
-pkg_check_modules(DVVa REQUIRED IMPORTED_TARGET libva)
+# VA-API is only used for FEL hardware upscaling; V4L2 stateless (ARM) builds
+# use the GPU shader path instead.
+option(CB1_ENABLE_VAAPI "Build the VA-API FEL upscaling backend" ON)
+if(CB1_ENABLE_VAAPI)
+  pkg_check_modules(DVVa IMPORTED_TARGET libva)
+endif()
+if(DVVa_FOUND)
+  set(CB1_FEL_VPP_SOURCE dvbridge_fel_vpp.c)
+else()
+  set(CB1_FEL_VPP_SOURCE dvbridge_fel_vpp_stub.c)
+endif()
 add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c dvbridge_cache.c
-                                dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c dvbridge_fel_vpp.c
+                                dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c ${CB1_FEL_VPP_SOURCE}
                                 dvbridge_policy.c cb1_circuit.c cb1_master_reference.c dvbridge_creative.c cb1_dv_enhanced.c cb1_processing.c)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/pack_gles300.vert" CB1_PACK_VERTEX)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/pack_gles300.frag" CB1_PACK_FRAGMENT)
@@ -58,7 +68,11 @@ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
                                          PkgConfig::DVAvcodec PkgConfig::DVGles
-                                         PkgConfig::DVEgl PkgConfig::DVDrm PkgConfig::DVVa m)
+                                         PkgConfig::DVEgl PkgConfig::DVDrm m)
+if(DVVa_FOUND)
+  target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVVa)
+  target_compile_definitions(dvbridge_core PUBLIC CB1_HAS_VAAPI=1)
+endif()
 if(CB1_ENABLE_HDR10_AI)
   target_compile_definitions(dvbridge_core PUBLIC CB1_HAS_HDR10_AI=1)
   set(CB1_L1L3_BUNDLE_CONTRACT "${CMAKE_CURRENT_SOURCE_DIR}/../models/l1l3/contract"
