@@ -62,15 +62,22 @@ struct dvbridge_fel {
     unsigned preroll_packets;
 };
 
-/* DRM PRIME decoders: the DRM device or a V4L2 stateless (v4l2request) one.
- * Compared by name so builds against FFmpeg without v4l2request still work. */
+/* Compared by name so builds against FFmpeg without v4l2request still work. */
+static bool v4l2request_device(const AVBufferRef *device)
+{
+    if (!device)
+        return false;
+    const char *name = av_hwdevice_get_type_name(((const AVHWDeviceContext *)device->data)->type);
+    return name && !strcmp(name, "v4l2request");
+}
+
+/* DRM PRIME decoders: the DRM device or a V4L2 stateless (v4l2request) one. */
 static bool drm_prime_device(const AVBufferRef *device)
 {
     if (!device)
         return false;
-    enum AVHWDeviceType type = ((const AVHWDeviceContext *)device->data)->type;
-    const char *name = av_hwdevice_get_type_name(type);
-    return type == AV_HWDEVICE_TYPE_DRM || (name && !strcmp(name, "v4l2request"));
+    return ((const AVHWDeviceContext *)device->data)->type == AV_HWDEVICE_TYPE_DRM ||
+           v4l2request_device(device);
 }
 
 static bool supported_device(const AVBufferRef *device)
@@ -86,6 +93,8 @@ static enum AVPixelFormat drm_prime_format(AVCodecContext *ctx, const enum AVPix
         found |= *formats == AV_PIX_FMT_DRM_PRIME;
     if (!found)
         return AV_PIX_FMT_NONE;
+    if (v4l2request_device(ctx->hw_device_ctx))
+        return AV_PIX_FMT_DRM_PRIME;
     /* Size the pool for the pairing queue where the hwaccel lets us; others
      * allocate their own DRM PRIME pool. */
     AVBufferRef *frames = NULL;
