@@ -197,7 +197,7 @@ fail:
 static bool import_plane(EGLDisplay display, PFNEGLCREATEIMAGEKHRPROC create,
                          PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind, bool modifiers,
                          const AVDRMFrameDescriptor *desc, int index, uint32_t fourcc,
-                         int width, int height, EGLImage *image, GLuint *texture)
+                         int width, int height, int fold, EGLImage *image, GLuint *texture)
 {
     const AVDRMLayerDescriptor *layer;
     const AVDRMPlaneDescriptor *plane;
@@ -210,7 +210,7 @@ static bool import_plane(EGLDisplay display, PFNEGLCREATEIMAGEKHRPROC create,
     EGLint attrs[24] = {
         EGL_WIDTH, width, EGL_HEIGHT, height, EGL_LINUX_DRM_FOURCC_EXT, (EGLint)fourcc,
         EGL_DMA_BUF_PLANE0_FD_EXT, object->fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)plane->offset,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)plane->pitch, EGL_NONE};
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)(plane->pitch * fold), EGL_NONE};
     if (modifiers && object->format_modifier != DRM_FORMAT_MOD_INVALID) {
         attrs[12] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
         attrs[13] = (EGLint)(object->format_modifier & UINT32_MAX);
@@ -236,7 +236,9 @@ static bool import_plane(EGLDisplay display, PFNEGLCREATEIMAGEKHRPROC create,
 
 /* NV15: 10-bit samples packed LSB-first, 4 samples in 5 bytes. Each output
  * texel is the sample MSB-aligned in UNORM16 (value << 6), i.e. the texel a
- * P010 import would give, so the rest of CB1 sees an ordinary P010 picture. */
+ * P010 import would give, so the rest of CB1 sees an ordinary P010 picture.
+ * The raw plane may be imported with u_fold rows per texture row, row y
+ * starting u_pitch bytes after row y - 1. */
 static const char nv15_vertex[] =
     "#version 300 es\n"
     "void main()\n"
@@ -250,10 +252,13 @@ static const char nv15_fragment[] =
     "precision highp int;\n"
     "uniform highp sampler2D u_source;\n"
     "uniform int u_chroma;\n"
+    "uniform int u_fold;\n"
+    "uniform int u_pitch;\n"
     "out highp vec4 o_colour;\n"
     "uint byteAt(int x, int y)\n"
     "{\n"
-    "  return uint(texelFetch(u_source, ivec2(x, y), 0).r * 255.0 + 0.5);\n"
+    "  ivec2 at = ivec2(x + (y % u_fold) * u_pitch, y / u_fold);\n"
+    "  return uint(texelFetch(u_source, at, 0).r * 255.0 + 0.5);\n"
     "}\n"
     "float sampleAt(int index, int y)\n"
     "{\n"
@@ -283,7 +288,7 @@ static const char nv15_fragment[] =
 static struct {
     EGLContext context;
     GLuint program, framebuffer;
-    GLint source, chroma;
+    GLint source, chroma, fold, pitch;
 } nv15_unpack;
 
 static GLuint compile(GLenum type, const char *source)
@@ -329,12 +334,15 @@ static bool nv15_unpack_init(void)
     nv15_unpack.program = program;
     nv15_unpack.source = glGetUniformLocation(program, "u_source");
     nv15_unpack.chroma = glGetUniformLocation(program, "u_chroma");
+    nv15_unpack.fold = glGetUniformLocation(program, "u_fold");
+    nv15_unpack.pitch = glGetUniformLocation(program, "u_pitch");
     glGenFramebuffers(1, &nv15_unpack.framebuffer);
     return nv15_unpack.framebuffer != 0;
 }
 
 /* Unpack two raw R8 NV15 plane textures into new UNORM16 textures in @frame. */
-static bool nv15_unpack_planes(struct dvbridge_dmabuf *frame, const GLuint raw[2])
+static bool nv15_unpack_planes(struct dvbridge_dmabuf *frame, const GLuint raw[2],
+                               const int fold[2], const int pitch[2])
 {
     if (!nv15_unpack_init())
         return false;
@@ -372,6 +380,8 @@ static bool nv15_unpack_planes(struct dvbridge_dmabuf *frame, const GLuint raw[2
         glViewport(0, 0, width, height);
         glBindTexture(GL_TEXTURE_2D, raw[i]);
         glUniform1i(nv15_unpack.chroma, i);
+        glUniform1i(nv15_unpack.fold, fold[i]);
+        glUniform1i(nv15_unpack.pitch, pitch[i]);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         frame->planes[i].width = width;
         frame->planes[i].height = height;
@@ -412,13 +422,32 @@ bool dvbridge_dmabuf_import_mapped(struct dvbridge_dmabuf *out)
     if (kind == DVBRIDGE_DMABUF_NV15) {
         /* Rows of width samples (luma) or width/2 Cb/Cr pairs, 10 bits each. */
         const int row_bytes = (candidate.width * 10 + 7) / 8;
+        const int heights[2] = {candidate.height, chroma_height};
         EGLImage raw_images[2] = {0};
         GLuint raw[2] = {0};
-        bool ok = import_plane(display, create, bind, modifiers, desc, 0, DRM_FORMAT_R8,
-                               row_bytes, candidate.height, &raw_images[0], &raw[0]) &&
-                  import_plane(display, create, bind, modifiers, desc, 1, DRM_FORMAT_R8,
-                               row_bytes, chroma_height, &raw_images[1], &raw[1]) &&
-                  nv15_unpack_planes(&candidate, raw);
+        int fold[2], pitch[2];
+        bool ok = true;
+        for (int i = 0; i < 2 && ok; ++i) {
+            const AVDRMLayerDescriptor *layer;
+            const AVDRMPlaneDescriptor *plane;
+            if (!drm_plane(desc, i, &layer, &plane)) {
+                ok = false;
+                break;
+            }
+            const AVDRMObjectDescriptor *object = &desc->objects[plane->object_index];
+            pitch[i] = (int)plane->pitch;
+            fold[i] = 1;
+            while ((pitch[i] * fold[i]) % 64)
+                fold[i] *= 2;
+            if ((uint64_t)plane->offset + (uint64_t)pitch[i] * fold[i] *
+                    ((heights[i] + fold[i] - 1) / fold[i]) > object->size)
+                fold[i] = 1;
+            ok = import_plane(display, create, bind, modifiers, desc, i, DRM_FORMAT_R8,
+                              fold[i] == 1 ? row_bytes : pitch[i] * fold[i],
+                              (heights[i] + fold[i] - 1) / fold[i], fold[i],
+                              &raw_images[i], &raw[i]);
+        }
+        ok = ok && nv15_unpack_planes(&candidate, raw, fold, pitch);
         /* GL keeps the raw imports alive until the unpack draws complete. */
         for (int i = 0; i < 2; ++i) {
             if (raw[i])
@@ -444,7 +473,7 @@ bool dvbridge_dmabuf_import_mapped(struct dvbridge_dmabuf *out)
             fourcc = i ? DRM_FORMAT_GR88 : DRM_FORMAT_R8;
         int width = i ? chroma_width : candidate.width;
         int height = i ? chroma_height : candidate.height;
-        if (!import_plane(display, create, bind, modifiers, desc, i, fourcc, width, height,
+        if (!import_plane(display, create, bind, modifiers, desc, i, fourcc, width, height, 1,
                           &candidate.images[i], &candidate.planes[i].texture))
             goto fail;
         candidate.planes[i].width = width;
