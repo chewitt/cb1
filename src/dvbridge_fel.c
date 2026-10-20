@@ -3,6 +3,9 @@
 #include "dvbridge_fel.h"
 #include <libavcodec/bsf.h>
 #include <libavutil/hwcontext.h>
+#ifdef CB1_HAS_VAAPI
+#include <libavutil/hwcontext_vaapi.h>
+#endif
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,6 +87,24 @@ static bool supported_device(const AVBufferRef *device)
 {
     return device && (((const AVHWDeviceContext *)device->data)->type == AV_HWDEVICE_TYPE_VAAPI ||
                       drm_prime_device(device));
+}
+
+/* BL decoder renewal can replace the device wrapper without changing the
+ * underlying VA display or DRM PRIME device type. */
+static bool same_device(const AVBufferRef *bound, const AVBufferRef *current)
+{
+    if (bound->data == current->data)
+        return true;
+    const AVHWDeviceContext *a = (void *)bound->data, *b = (void *)current->data;
+    if (a->type != b->type)
+        return false;
+#ifdef CB1_HAS_VAAPI
+    if (a->type == AV_HWDEVICE_TYPE_VAAPI) {
+        const AVVAAPIDeviceContext *va = a->hwctx, *vb = b->hwctx;
+        return va && vb && va->display && va->display == vb->display;
+    }
+#endif
+    return drm_prime_device(bound);
 }
 
 static enum AVPixelFormat drm_prime_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
@@ -318,7 +339,7 @@ bool dvbridge_fel_device(struct dvbridge_fel *f, AVBufferRef *device)
     if (!f || !supported_device(device))
         return false;
     if (f->opened)
-        return f->decoder->hw_device_ctx->data == device->data && pump(f);
+        return same_device(f->decoder->hw_device_ctx, device) && pump(f);
     f->decoder->hw_device_ctx = av_buffer_ref(device);
     if (!f->decoder->hw_device_ctx || avcodec_open2(f->decoder, f->decoder->codec, NULL) < 0) {
         f->failed = true;
