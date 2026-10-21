@@ -145,6 +145,20 @@ static bool drm_source(const AVDRMFrameDescriptor *desc, int width, int height,
         uint64_t row_bytes = *source == DVBRIDGE_DMABUF_NV15 ? (samples * 10 + 7) / 8 :
                              *source == DVBRIDGE_DMABUF_P010 ? samples * 2 : samples;
         uint64_t rows = i ? (height + 1) / 2 : height;
+        if (fourcc_mod_broadcom_mod(object->format_modifier) == DRM_FORMAT_MOD_BROADCOM_SAND128) {
+            /* 128-byte columns of 96 (P030) or 128 (NV12) samples; the column height is the
+             * modifier parameter, or the pitch when the modifier carries none. */
+            uint64_t column_height = fourcc_mod_broadcom_param(object->format_modifier);
+            if (!column_height)
+                column_height = plane->pitch > 0 ? (uint64_t)plane->pitch : 0;
+            uint64_t column_samples = format == DRM_FORMAT_P030 ? 96 : 128;
+            uint64_t columns = (samples + column_samples - 1) / column_samples;
+            if (plane->offset < 0 || column_height < rows ||
+                (uint64_t)plane->offset + (columns - 1) * 128 * column_height + 128 * rows >
+                    object->size)
+                return false;
+            continue;
+        }
         if (plane->offset < 0 || plane->pitch <= 0 || (uint64_t)plane->pitch < row_bytes ||
             (uint64_t)plane->offset + (rows - 1) * plane->pitch + row_bytes > object->size)
             return false;
