@@ -118,12 +118,18 @@ static bool drm_source(const AVDRMFrameDescriptor *desc, int width, int height,
     }
     if (desc->nb_layers != 1 || desc->layers[0].nb_planes != 2)
         return false;
-    for (int i = 0; i < desc->nb_objects; ++i)
-        if (desc->objects[i].format_modifier != DRM_FORMAT_MOD_LINEAR &&
-            desc->objects[i].format_modifier != DRM_FORMAT_MOD_INVALID)
+    const uint32_t format = desc->layers[0].format;
+    for (int i = 0; i < desc->nb_objects; ++i) {
+        const uint64_t modifier = desc->objects[i].format_modifier;
+        const bool sand = fourcc_mod_broadcom_mod(modifier) == DRM_FORMAT_MOD_BROADCOM_SAND128;
+        if (sand ? format != DRM_FORMAT_NV12 && format != DRM_FORMAT_P030
+                 : (modifier != DRM_FORMAT_MOD_LINEAR && modifier != DRM_FORMAT_MOD_INVALID) ||
+                   format == DRM_FORMAT_P030)
             return false;
-    switch (desc->layers[0].format) {
-    case DRM_FORMAT_P010: *source = DVBRIDGE_DMABUF_P010; break;
+    }
+    switch (format) {
+    case DRM_FORMAT_P010:
+    case DRM_FORMAT_P030: *source = DVBRIDGE_DMABUF_P010; break;
     case DRM_FORMAT_NV12: *source = DVBRIDGE_DMABUF_NV12; break;
     case DRM_FORMAT_NV15: *source = DVBRIDGE_DMABUF_NV15; break;
     default: return false;
